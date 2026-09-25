@@ -62,7 +62,10 @@ def verify_and_parse_event(payload: bytes, sig_header: str):
 
 def handle_webhook_event(db: Session, event: dict) -> None:
     event_type = event["type"]
-    data = event["data"]["object"]
+    # 新しいバージョンのstripeライブラリでは、event["data"]["object"]が
+    # 辞書(dict)ではなく専用オブジェクトになり、.get()が使えなくなった。
+    # to_dict()で辞書に変換してから、これまで通り.get()で扱う。
+    data = event["data"]["object"].to_dict()
 
     if event_type == "checkout.session.completed":
         line_user_id = data.get("client_reference_id")
