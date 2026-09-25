@@ -2,7 +2,8 @@
 LINE Messaging APIのWebhook処理。
 
 会話フロー:
-1. 友だち追加:ルナ・玄が挨拶し、生年月日を尋ねる(YYYY-MM-DD形式)
+1. 友だち追加:ルナ・玄が挨拶し、生年月日を尋ねる(YYYY-MM-DD、YYYY/MM/DD、
+   YYYYMMDD、和暦「平成7年4月12日」など複数の形式に対応。app.date_parsingを参照)
 2. 任意:生まれた時間・場所を尋ねる(「スキップ」で省略可)
 3. 以降:カテゴリ選択(恋愛運/仕事運/金運/健康運/総合運/相性診断)のクイックリプライを出し、
    選択されたらそのまま鑑定文を生成して返信する(相性診断のみ、代わりに
@@ -26,8 +27,6 @@ LINE Messaging APIのWebhook処理。
 鑑定文以外の案内・エラーメッセージも、すべてルナ(優しい語り)・玄(断定的な
 一言)の掛け合い口調で統一している(_reply_dialogueを経由して送信)。
 """
-from datetime import datetime
-
 from linebot import LineBotApi, WebhookParser
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -38,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import User, ChatLog
+from app.date_parsing import parse_birth_date
 from app import fortune_service, payment, tarot
 
 line_bot_api = LineBotApi(settings.LINE_CHANNEL_ACCESS_TOKEN)
@@ -300,13 +300,13 @@ def _handle_text_message(db: Session, event: MessageEvent) -> None:
 
 
 def _handle_birth_date_input(db: Session, event, user: User, text: str) -> None:
-    try:
-        birth_date = datetime.strptime(text, "%Y-%m-%d").date()
-    except ValueError:
+    birth_date = parse_birth_date(text)
+    if birth_date is None:
         _reply_dialogue(
             event,
             "ルナ:あれ、その書き方だとわたし読めないみたい。"
-            "「1990-05-20」のような形で、もう一度教えてくれる?\n"
+            "「1990-05-20」「1990/05/20」「19900520」「平成2年5月20日」の"
+            "どれかの形で、もう一度教えてくれる?\n"
             "玄:形式くらい合わせな。",
         )
         return
@@ -354,13 +354,13 @@ def _handle_partner_birth_date_input(db: Session, event, user: User, text: str) 
     date_token = tokens[-1]
     partner_name = " ".join(tokens[:-1]) if len(tokens) > 1 else None
 
-    try:
-        partner_birth_date = datetime.strptime(date_token, "%Y-%m-%d").date()
-    except ValueError:
+    partner_birth_date = parse_birth_date(date_token)
+    if partner_birth_date is None:
         _reply_dialogue(
             event,
             "ルナ:ごめんね、その書き方だと読めないの。"
-            "「さくら 1993-11-02」のような形で、相手の名前と生まれた日を教えてくれる?\n"
+            "「さくら 1993-11-02」「さくら 1993/11/02」「さくら 19931102」の"
+            "どれかの形で、相手の名前と生まれた日を教えてくれる?\n"
             "玄:さっさと送りな。",
         )
         return
