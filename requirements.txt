@@ -7,4 +7,4 @@ sqlalchemy
 python-dotenv
 kerykeion
 apscheduler
-psycopg2-binary
+psycopg[binary]
