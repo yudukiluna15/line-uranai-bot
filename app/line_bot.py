@@ -78,7 +78,7 @@ PLAN_CATEGORIES = {
 }
 
 # プランごとの相性診断の月間利用上限
-COMPATIBILITY_MONTHLY_LIMIT = {"free": 99, "standard": 5, "premium": 15}
+COMPATIBILITY_MONTHLY_LIMIT = {"free": 1, "standard": 5, "premium": 15}
 
 MAIN_MENU_QUICK_REPLY = QuickReply(
     items=[QuickReplyButton(action=MessageAction(label=c, text=c)) for c in CATEGORIES]
