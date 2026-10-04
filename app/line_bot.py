@@ -7,8 +7,8 @@ LINE Messaging APIのWebhook処理。
 2. 任意:生まれた時間・場所を尋ねる(「スキップ」で省略可)
 3. 以降:カテゴリ選択(恋愛運/仕事運/金運/健康運/総合運/相性診断)のクイックリプライを出し、
    選択されたらそのまま鑑定文を生成して返信する(相性診断のみ、代わりに
-   相手の名前・生年月日を尋ねる)。悩み相談機能は持たず、受け身型の
-   運勢鑑定のみを提供する方針にしている。
+   「相手の名前」→「相手の生年月日」の順に2回に分けて尋ねる)。悩み相談機能は
+   持たず、受け身型の運勢鑑定のみを提供する方針にしている。
 4. プランごとに使えるカテゴリが異なる(PLAN_CATEGORIESを参照)
    - 無料:総合運のみ、1日FREE_DAILY_LIMIT回まで
    - スタンダード:総合運・恋愛運・仕事運
@@ -23,6 +23,11 @@ LINE Messaging APIのWebhook処理。
    相談窓口の案内に切り替える(CRISIS_KEYWORDS / _handle_crisis_signal)
 9. 総合運の後は「今日の1枚」ボタンで、今日引いたタロットカードの画像を
    見られる(TAROT_IMAGE_BASE_URL未設定の間はテキストでカード名を返す)
+
+相性診断の入力待ち状態は User.onboarding_step に保存している(DBの列追加は不要)。
+   - "awaiting_partner_name":相手の名前を待っている
+   - "partner_birth:<名前>":名前は受け取り済みで、生年月日を待っている
+   - 入力待ちの間は「キャンセル」でいつでも抜けられる
 
 鑑定文以外の案内・エラーメッセージも、すべてルナ(優しい語り)・玄(断定的な
 一言)の掛け合い口調で統一している(_reply_dialogueを経由して送信)。
@@ -46,6 +51,14 @@ parser = WebhookParser(settings.LINE_CHANNEL_SECRET)
 CATEGORIES = ["恋愛運", "仕事運", "金運", "健康運", "総合運", "相性診断"]
 FREE_CATEGORY = "総合運"
 TODAYS_CARD_COMMAND = "今日の1枚"
+
+# 相性診断の入力待ち状態(User.onboarding_stepに保存する値)
+STEP_PARTNER_NAME = "awaiting_partner_name"
+STEP_PARTNER_BIRTH_PREFIX = "partner_birth:"  # この後ろに相手の名前が続く
+STEP_PARTNER_BIRTH_LEGACY = "awaiting_partner_birthdate"  # 旧方式(名前なし)の途中だった人用
+# 名前の最大文字数。onboarding_step列の長さを超えないよう、短めに切っている
+PARTNER_NAME_MAX_LENGTH = 12
+CANCEL_WORDS = {"キャンセル", "やめる", "戻る"}
 
 # 表示ラベル → 内部で使うカテゴリキー(ai_service.CATEGORY_ELEMENTSのキーと対応)
 CATEGORY_LABEL_TO_KEY = {
@@ -77,6 +90,11 @@ PLAN_SELECT_QUICK_REPLY = QuickReply(
         QuickReplyButton(action=MessageAction(label="スタンダード登録", text="スタンダード登録")),
         QuickReplyButton(action=MessageAction(label="プレミアム登録", text="プレミアム登録")),
     ]
+)
+
+# 相性診断の入力待ち中に表示する「やめる」ボタン
+CANCEL_QUICK_REPLY = QuickReply(
+    items=[QuickReplyButton(action=MessageAction(label="キャンセル", text="キャンセル"))]
 )
 
 # 深刻な相談のサイン。ここに該当する場合は占いとして処理せず、
@@ -228,6 +246,26 @@ def _handle_crisis_signal(event) -> None:
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message))
 
 
+def _is_awaiting_partner_birth(step: str) -> bool:
+    return step.startswith(STEP_PARTNER_BIRTH_PREFIX) or step == STEP_PARTNER_BIRTH_LEGACY
+
+
+def _partner_name_from_step(step: str) -> str | None:
+    """onboarding_stepに埋め込んで保存してある相手の名前を取り出す。"""
+    if step.startswith(STEP_PARTNER_BIRTH_PREFIX):
+        return step[len(STEP_PARTNER_BIRTH_PREFIX):] or None
+    return None
+
+
+def _clean_partner_name(raw: str) -> str:
+    """
+    相手の名前を整える。セリフの分割(「ルナ:」「玄:」)を壊さないよう
+    コロンを取り除き、長すぎる場合は切り詰める。
+    """
+    cleaned = raw.replace(":", "").replace("：", "").replace("\n", " ").strip()
+    return cleaned[:PARTNER_NAME_MAX_LENGTH]
+
+
 def _handle_text_message(db: Session, event: MessageEvent) -> None:
     line_user_id = event.source.user_id
     text = event.message.text.strip()
@@ -238,19 +276,40 @@ def _handle_text_message(db: Session, event: MessageEvent) -> None:
         return
 
     user = _get_or_create_user(db, line_user_id)
+    step = user.onboarding_step or ""
 
     # --- オンボーディング中の処理 ---
-    if user.onboarding_step == "need_birth_date":
+    if step == "need_birth_date":
         _handle_birth_date_input(db, event, user, text)
         return
 
-    if user.onboarding_step == "need_time_place":
+    if step == "need_time_place":
         _handle_time_place_input(db, event, user, text)
         return
 
-    if user.onboarding_step == "awaiting_partner_birthdate":
-        _handle_partner_birth_date_input(db, event, user, text)
-        return
+    # --- 相性診断の入力待ち(名前待ち / 生年月日待ち) ---
+    if step == STEP_PARTNER_NAME or _is_awaiting_partner_birth(step):
+        if text in CANCEL_WORDS:
+            user.onboarding_step = "done"
+            db.commit()
+            _reply_dialogue(
+                event,
+                "ルナ:わかった、相性診断はやめておくね。\n"
+                "玄:また気が向いたら選びな。",
+                MAIN_MENU_QUICK_REPLY,
+            )
+            return
+
+        if text in CATEGORIES or text == "プラン確認":
+            # メニューのボタンが押された場合は、入力待ちをやめて通常の処理に進む
+            user.onboarding_step = "done"
+            db.commit()
+        elif step == STEP_PARTNER_NAME:
+            _handle_partner_name_input(db, event, user, text)
+            return
+        else:
+            _handle_partner_birth_date_input(db, event, user, text)
+            return
 
     # --- 共通コマンド ---
     if text == "プラン確認":
@@ -342,29 +401,89 @@ def _handle_time_place_input(db: Session, event, user: User, text: str) -> None:
     )
 
 
-def _handle_partner_birth_date_input(db: Session, event, user: User, text: str) -> None:
+def _handle_partner_name_input(db: Session, event, user: User, text: str) -> None:
     """
-    「さくら 1993-11-02」のように、相手の名前+生年月日をまとめて受け取る。
-    名前を省略して日付だけ送られた場合も、後方互換として受け付ける。
+    相性診断の1ステップ目:相手の名前を受け取り、次に生年月日を尋ねる。
+    名前はonboarding_stepに埋め込んで保存する("partner_birth:<名前>")。
     """
     tokens = text.split()
-    if not tokens:
-        tokens = [text]
 
-    date_token = tokens[-1]
-    partner_name = " ".join(tokens[:-1]) if len(tokens) > 1 else None
+    # 以前の入力形式「さくら 1993-11-02」(名前と生年月日を一度に送る)にも対応しておく
+    if len(tokens) >= 2:
+        date_candidate = parse_birth_date(tokens[-1])
+        if date_candidate is not None:
+            partner_name = _clean_partner_name(" ".join(tokens[:-1])) or None
+            _finish_compatibility(db, event, user, partner_name, date_candidate)
+            return
 
-    partner_birth_date = parse_birth_date(date_token)
+    # 日付だけが送られてきた場合は、名前を先に聞き直す
+    if parse_birth_date(text) is not None:
+        _reply_dialogue(
+            event,
+            "ルナ:生まれた日は、お名前のあとで聞くね。"
+            "先に相手の名前(ニックネームでOK)を教えてくれる?\n"
+            "玄:順番だ。",
+            CANCEL_QUICK_REPLY,
+        )
+        return
+
+    partner_name = _clean_partner_name(text)
+    if not partner_name:
+        _reply_dialogue(
+            event,
+            "ルナ:ごめんね、お名前がうまく読み取れなかったの。"
+            "ニックネームでもいいから、もう一度教えてくれる?\n"
+            "玄:短くていい。",
+            CANCEL_QUICK_REPLY,
+        )
+        return
+
+    user.onboarding_step = f"{STEP_PARTNER_BIRTH_PREFIX}{partner_name}"
+    db.commit()
+
+    _reply_dialogue(
+        event,
+        f"ルナ:{partner_name}さんだね。{partner_name}さんの生まれた日も教えてくれる?"
+        "「1993-11-02」「19931102」「平成5年11月2日」のどれでも大丈夫だよ。\n"
+        "玄:早く送りな。",
+        CANCEL_QUICK_REPLY,
+    )
+
+
+def _handle_partner_birth_date_input(db: Session, event, user: User, text: str) -> None:
+    """
+    相性診断の2ステップ目:相手の生年月日を受け取り、鑑定する。
+    名前は1ステップ目で保存済み。旧方式の途中だった人や、
+    「さくら 1993-11-02」のように名前込みで送ってきた場合にも対応する。
+    """
+    partner_name = _partner_name_from_step(user.onboarding_step or "")
+    tokens = text.split()
+
+    partner_birth_date = parse_birth_date(text)
+    if partner_birth_date is None and len(tokens) >= 2:
+        partner_birth_date = parse_birth_date(tokens[-1])
+        if partner_birth_date is not None and partner_name is None:
+            partner_name = _clean_partner_name(" ".join(tokens[:-1])) or None
+
     if partner_birth_date is None:
         _reply_dialogue(
             event,
             "ルナ:ごめんね、その書き方だと読めないの。"
-            "「さくら 1993-11-02」「さくら 1993/11/02」「さくら 19931102」の"
-            "どれかの形で、相手の名前と生まれた日を教えてくれる?\n"
+            "「1993-11-02」「1993/11/02」「19931102」「平成5年11月2日」の"
+            "どれかの形で、相手の生まれた日を教えてくれる?"
+            "やめるときは「キャンセル」って送ってね。\n"
             "玄:さっさと送りな。",
+            CANCEL_QUICK_REPLY,
         )
         return
 
+    _finish_compatibility(db, event, user, partner_name, partner_birth_date)
+
+
+def _finish_compatibility(
+    db: Session, event, user: User, partner_name: str | None, partner_birth_date
+) -> None:
+    """相性診断の入力がそろった後の共通処理(鑑定文の生成と返信)。"""
     user.onboarding_step = "done"
     db.commit()
 
@@ -403,13 +522,14 @@ def _handle_category_request(db: Session, event, user: User, category_label: str
             )
             return
 
-        user.onboarding_step = "awaiting_partner_birthdate"
+        # まず相手の名前を尋ねる(生年月日はそのあと)
+        user.onboarding_step = STEP_PARTNER_NAME
         db.commit()
         _reply_dialogue(
             event,
-            "ルナ:相性を見たい相手の名前と生まれた日を、"
-            "「さくら 1993-11-02」のような形で教えてくれる?\n"
-            "玄:さっさと送りな。",
+            "ルナ:相性を見たい相手の名前を教えてくれる?ニックネームでも大丈夫だよ。\n"
+            "玄:早く言いな。",
+            CANCEL_QUICK_REPLY,
         )
         return
 
